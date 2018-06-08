@@ -422,7 +422,7 @@ class LowerTypeTestsModule {
                               ArrayRef<GlobalTypeMember *> Globals,
                               ArrayRef<ICallBranchFunnel *> ICallBranchFunnels);
 
-  void replaceWeakDeclarationWithJumpTablePtr(Function *F, Constant *JT);
+  void replaceWeakDeclarationWithJumpTablePtr(Function *F, Constant *JT, bool IsDefinition);
   void moveInitializerToModuleConstructor(GlobalVariable *GV);
   void findGlobalVariableUsersOf(Constant *C,
                                  SmallSetVector<GlobalVariable *, 8> &Out);
@@ -434,7 +434,7 @@ class LowerTypeTestsModule {
   /// the block. 'This's use list is expected to have at least one element.
   /// Unlike replaceAllUsesWith this function skips blockaddr and direct call
   /// uses.
-  void replaceCfiUses(Value *Old, Value *New);
+  void replaceCfiUses(Function *Old, Value *New, bool IsDefinition);
 
   /// replaceDirectCalls - Go through the uses list for this definition and
   /// replace each use, which is a direct function call.
@@ -982,11 +982,15 @@ void LowerTypeTestsModule::importFunction(Function *F, bool isDefinition) {
   std::string Name = F->getName();
 
   if (F->isDeclarationForLinker() && isDefinition) {
-    Function *RealF = Function::Create(F->getFunctionType(),
-                                       GlobalValue::ExternalLinkage,
-                                       Name + ".cfi", &M);
-    RealF->setVisibility(Visibility);
-    replaceDirectCalls(F, RealF);
+    // Non-dso_local functions may be overriden at run time,
+    // don't short curcuit them
+    if (F->isDSOLocal()) {
+      Function *RealF = Function::Create(F->getFunctionType(),
+                                         GlobalValue::ExternalLinkage,
+                                         Name + ".cfi", &M);
+      RealF->setVisibility(GlobalVariable::HiddenVisibility);
+      replaceDirectCalls(F, RealF);
+    }
     return;
   }
 
@@ -999,10 +1003,10 @@ void LowerTypeTestsModule::importFunction(Function *F, bool isDefinition) {
   } else if (isDefinition) {
     F->setName(Name + ".cfi");
     F->setLinkage(GlobalValue::ExternalLinkage);
-    F->setVisibility(GlobalValue::HiddenVisibility);
     FDecl = Function::Create(F->getFunctionType(), GlobalValue::ExternalLinkage,
                              Name, &M);
     FDecl->setVisibility(Visibility);
+    Visibility = GlobalValue::HiddenVisibility;
 
     // Delete aliases pointing to this function, they'll be re-created in the
     // merged output
@@ -1028,9 +1032,13 @@ void LowerTypeTestsModule::importFunction(Function *F, bool isDefinition) {
   }
 
   if (F->isWeakForLinker())
-    replaceWeakDeclarationWithJumpTablePtr(F, FDecl);
+    replaceWeakDeclarationWithJumpTablePtr(F, FDecl, isDefinition);
   else
-    replaceCfiUses(F, FDecl);
+    replaceCfiUses(F, FDecl, isDefinition);
+
+  // Set visibility late because it's used in replaceCfiUses() to determine
+  // whether uses need to to be replaced.
+  F->setVisibility(Visibility);
 }
 
 void LowerTypeTestsModule::lowerTypeTestCalls(
@@ -1212,7 +1220,7 @@ void LowerTypeTestsModule::findGlobalVariableUsersOf(
 
 // Replace all uses of F with (F ? JT : 0).
 void LowerTypeTestsModule::replaceWeakDeclarationWithJumpTablePtr(
-    Function *F, Constant *JT) {
+    Function *F, Constant *JT, bool IsDefinition) {
   // The target expression can not appear in a constant initializer on most
   // (all?) targets. Switch to a runtime initializer.
   SmallSetVector<GlobalVariable *, 8> GlobalVarUsers;
@@ -1225,7 +1233,7 @@ void LowerTypeTestsModule::replaceWeakDeclarationWithJumpTablePtr(
   Function *PlaceholderFn =
       Function::Create(cast<FunctionType>(F->getValueType()),
                        GlobalValue::ExternalWeakLinkage, "", &M);
-  replaceCfiUses(F, PlaceholderFn);
+  replaceCfiUses(F, PlaceholderFn, IsDefinition);
 
   Constant *Target = ConstantExpr::getSelect(
       ConstantExpr::getICmp(CmpInst::ICMP_NE, F,
@@ -1447,9 +1455,9 @@ void LowerTypeTestsModule::buildBitSetsFromFunctionsNative(
     }
     if (!IsDefinition) {
       if (F->isWeakForLinker())
-        replaceWeakDeclarationWithJumpTablePtr(F, CombinedGlobalElemPtr);
+        replaceWeakDeclarationWithJumpTablePtr(F, CombinedGlobalElemPtr, IsDefinition);
       else
-        replaceCfiUses(F, CombinedGlobalElemPtr);
+        replaceCfiUses(F, CombinedGlobalElemPtr, IsDefinition);
     } else {
       assert(F->getType()->getAddressSpace() == 0);
 
@@ -1459,7 +1467,9 @@ void LowerTypeTestsModule::buildBitSetsFromFunctionsNative(
       FAlias->takeName(F);
       if (FAlias->hasName())
         F->setName(FAlias->getName() + ".cfi");
-      replaceCfiUses(F, FAlias);
+      replaceCfiUses(F, FAlias, IsDefinition);
+      if (!F->hasLocalLinkage())
+        F->setVisibility(GlobalVariable::HiddenVisibility);
     }
   }
 
@@ -1581,7 +1591,7 @@ LowerTypeTestsModule::LowerTypeTestsModule(
 }
 
 bool LowerTypeTestsModule::runForTesting(Module &M) {
-  ModuleSummaryIndex Summary(/*IsPerformingAnalysis=*/false);
+  ModuleSummaryIndex Summary(/*HaveGVs=*/false);
 
   // Handle the command-line summary arguments. This code is for testing
   // purposes only, so we handle errors directly.
@@ -1626,7 +1636,7 @@ static bool isDirectCall(Use& U) {
   return false;
 }
 
-void LowerTypeTestsModule::replaceCfiUses(Value *Old, Value *New) {
+void LowerTypeTestsModule::replaceCfiUses(Function *Old, Value *New, bool IsDefinition) {
   SmallSetVector<Constant *, 4> Constants;
   auto UI = Old->use_begin(), E = Old->use_end();
   for (; UI != E;) {
@@ -1637,8 +1647,8 @@ void LowerTypeTestsModule::replaceCfiUses(Value *Old, Value *New) {
     if (isa<BlockAddress>(U.getUser()))
       continue;
 
-    // Skip direct calls
-    if (isDirectCall(U))
+    // Skip direct calls to externally defined or non-dso_local functions
+    if (isDirectCall(U) && (Old->isDSOLocal() || !IsDefinition))
       continue;
 
     // Must handle Constants specially, we cannot call replaceUsesOfWith on a
