@@ -337,7 +337,7 @@ namespace llvm {
 
       // Arithmetic operations with FLAGS results.
       ADD, SUB, ADC, SBB, SMUL, UMUL,
-      INC, DEC, OR, XOR, AND,
+      OR, XOR, AND,
 
       // Bit field extract.
       BEXTR,
@@ -568,7 +568,7 @@ namespace llvm {
 
       /// LOCK-prefixed arithmetic read-modify-write instructions.
       /// EFLAGS, OUTCHAIN = LADD(INCHAIN, PTR, RHS)
-      LADD, LSUB, LOR, LXOR, LAND, LINC, LDEC,
+      LADD, LSUB, LOR, LXOR, LAND,
 
       // Load, scalar_to_vector, and zero extend.
       VZEXT_LOAD,
@@ -1038,6 +1038,11 @@ namespace llvm {
     /// with this index.
     bool isExtractSubvectorCheap(EVT ResVT, EVT SrcVT,
                                  unsigned Index) const override;
+
+    /// Scalar ops always have equal or better analysis/performance/power than
+    /// the vector equivalent, so this always makes sense if the scalar op is
+    /// supported.
+    bool shouldScalarizeBinop(SDValue) const override;
 
     bool storeOfVectorConstantIsCheap(EVT MemVT, unsigned NumElem,
                                       unsigned AddrSpace) const override {
