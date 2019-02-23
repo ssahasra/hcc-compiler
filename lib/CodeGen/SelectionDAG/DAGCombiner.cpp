@@ -2312,10 +2312,12 @@ SDValue DAGCombiner::visitADDLike(SDValue N0, SDValue N1, SDNode *LocReference) 
   if (SDValue V = foldAddSubMasked1(true, N0, N1, DAG, DL))
     return V;
 
-  // add (sext i1), X -> sub X, (zext i1)
+  // If the target's bool is represented as 0/1, prefer to make this 'sub 0/1'
+  // rather than 'add 0/-1' (the zext should get folded).
+  // add (sext i1 Y), X --> sub X, (zext i1 Y)
   if (N0.getOpcode() == ISD::SIGN_EXTEND &&
-      N0.getOperand(0).getValueType() == MVT::i1 &&
-      !TLI.isOperationLegal(ISD::SIGN_EXTEND, MVT::i1)) {
+      N0.getOperand(0).getScalarValueSizeInBits() == 1 &&
+      TLI.getBooleanContents(VT) == TargetLowering::ZeroOrOneBooleanContent) {
     SDValue ZExt = DAG.getNode(ISD::ZERO_EXTEND, DL, VT, N0.getOperand(0));
     return DAG.getNode(ISD::SUB, DL, VT, N1, ZExt);
   }
@@ -2762,6 +2764,17 @@ SDValue DAGCombiner::visitSUB(SDNode *N) {
 
   if (SDValue V = foldAddSubMasked1(false, N0, N1, DAG, SDLoc(N)))
     return V;
+
+  // If the target's bool is represented as 0/-1, prefer to make this 'add 0/-1'
+  // rather than 'sub 0/1' (the sext should get folded).
+  // sub X, (zext i1 Y) --> add X, (sext i1 Y)
+  if (N1.getOpcode() == ISD::ZERO_EXTEND &&
+      N1.getOperand(0).getScalarValueSizeInBits() == 1 &&
+      TLI.getBooleanContents(VT) ==
+          TargetLowering::ZeroOrNegativeOneBooleanContent) {
+    SDValue SExt = DAG.getNode(ISD::SIGN_EXTEND, DL, VT, N1.getOperand(0));
+    return DAG.getNode(ISD::ADD, DL, VT, N0, SExt);
+  }
 
   // fold Y = sra (X, size(X)-1); sub (xor (X, Y), Y) -> (abs X)
   if (TLI.isOperationLegalOrCustom(ISD::ABS, VT)) {
@@ -13965,7 +13978,7 @@ CheckForMaskedLoad(SDValue V, SDValue Ptr, SDValue Chain) {
   if (NotMaskTZ && NotMaskTZ/8 % MaskedBytes) return Result;
 
   // For narrowing to be valid, it must be the case that the load the
-  // immediately preceeding memory operation before the store.
+  // immediately preceding memory operation before the store.
   if (LD == Chain.getNode())
     ; // ok.
   else if (Chain->getOpcode() == ISD::TokenFactor &&
@@ -15416,7 +15429,7 @@ SDValue DAGCombiner::visitSTORE(SDNode *N) {
         const BaseIndexOffset ChainBase = BaseIndexOffset::match(ST1, DAG);
         unsigned STByteSize = ST->getMemoryVT().getSizeInBits() / 8;
         unsigned ChainByteSize = ST1->getMemoryVT().getSizeInBits() / 8;
-        // If this is a store who's preceeding store to a subset of the current
+        // If this is a store who's preceding store to a subset of the current
         // location and no one other node is chained to that store we can
         // effectively drop the store. Do not remove stores to undef as they may
         // be used as data sinks.
@@ -15424,6 +15437,33 @@ SDValue DAGCombiner::visitSTORE(SDNode *N) {
           CombineTo(ST1, ST1->getChain());
           return SDValue();
         }
+
+        // If ST stores to a subset of preceding store's write set, we may be
+        // able to fold ST's value into the preceding stored value. As we know
+        // the other uses of ST1's chain are unconcerned with ST, this folding
+        // will not affect those nodes.
+        int64_t Offset;
+        if (ChainBase.contains(ChainByteSize, STBase, STByteSize, DAG,
+                               Offset)) {
+          SDValue ChainValue = ST1->getValue();
+          if (auto *C1 = dyn_cast<ConstantSDNode>(ChainValue)) {
+            if (auto *C = dyn_cast<ConstantSDNode>(Value)) {
+              APInt Val = C1->getAPIntValue();
+              APInt InsertVal = C->getAPIntValue().zextOrTrunc(STByteSize * 8);
+              // FIXME: Handle Big-endian mode.
+              if (!DAG.getDataLayout().isBigEndian()) {
+                Val.insertBits(InsertVal, Offset * 8);
+                SDValue NewSDVal =
+                    DAG.getConstant(Val, SDLoc(C), ChainValue.getValueType(),
+                                    C1->isTargetOpcode(), C1->isOpaque());
+                SDNode *NewST1 = DAG.UpdateNodeOperands(
+                    ST1, ST1->getChain(), NewSDVal, ST1->getOperand(2),
+                    ST1->getOperand(3));
+                return CombineTo(ST, SDValue(NewST1, 0));
+              }
+            }
+          }
+        } // End ST subset of ST1 case.
       }
     }
   }
