@@ -574,8 +574,7 @@ void SIInstrInfo::copyPhysReg(MachineBasicBlock &MBB,
   unsigned EltSize = 4;
   unsigned Opcode = AMDGPU::V_MOV_B32_e32;
   if (RI.isSGPRClass(RC)) {
-    // TODO: Copy vec3/vec5 with s_mov_b64s then final s_mov_b32.
-    if (!(RI.getRegSizeInBits(*RC) % 64)) {
+    if (RI.getRegSizeInBits(*RC) > 32) {
       Opcode =  AMDGPU::S_MOV_B64;
       EltSize = 8;
     } else {
@@ -853,12 +852,8 @@ static unsigned getSGPRSpillSaveOpcode(unsigned Size) {
     return AMDGPU::SI_SPILL_S32_SAVE;
   case 8:
     return AMDGPU::SI_SPILL_S64_SAVE;
-  case 12:
-    return AMDGPU::SI_SPILL_S96_SAVE;
   case 16:
     return AMDGPU::SI_SPILL_S128_SAVE;
-  case 20:
-    return AMDGPU::SI_SPILL_S160_SAVE;
   case 32:
     return AMDGPU::SI_SPILL_S256_SAVE;
   case 64:
@@ -878,8 +873,6 @@ static unsigned getVGPRSpillSaveOpcode(unsigned Size) {
     return AMDGPU::SI_SPILL_V96_SAVE;
   case 16:
     return AMDGPU::SI_SPILL_V128_SAVE;
-  case 20:
-    return AMDGPU::SI_SPILL_V160_SAVE;
   case 32:
     return AMDGPU::SI_SPILL_V256_SAVE;
   case 64:
@@ -961,12 +954,8 @@ static unsigned getSGPRSpillRestoreOpcode(unsigned Size) {
     return AMDGPU::SI_SPILL_S32_RESTORE;
   case 8:
     return AMDGPU::SI_SPILL_S64_RESTORE;
-  case 12:
-    return AMDGPU::SI_SPILL_S96_RESTORE;
   case 16:
     return AMDGPU::SI_SPILL_S128_RESTORE;
-  case 20:
-    return AMDGPU::SI_SPILL_S160_RESTORE;
   case 32:
     return AMDGPU::SI_SPILL_S256_RESTORE;
   case 64:
@@ -986,8 +975,6 @@ static unsigned getVGPRSpillRestoreOpcode(unsigned Size) {
     return AMDGPU::SI_SPILL_V96_RESTORE;
   case 16:
     return AMDGPU::SI_SPILL_V128_RESTORE;
-  case 20:
-    return AMDGPU::SI_SPILL_V160_RESTORE;
   case 32:
     return AMDGPU::SI_SPILL_V256_RESTORE;
   case 64:
@@ -1947,18 +1934,14 @@ void SIInstrInfo::insertSelect(MachineBasicBlock &MBB,
   const int16_t *SubIndices = Sub0_15;
   int NElts = DstSize / 32;
 
-  // 64-bit select is only available for SALU.
-  // TODO: Split 96-bit into 64-bit and 32-bit, not 3x 32-bit.
+  // 64-bit select is only avaialble for SALU.
   if (Pred == SCC_TRUE) {
-    if (NElts % 2) {
-      SelOp = AMDGPU::S_CSELECT_B32;
-      EltRC = &AMDGPU::SGPR_32RegClass;
-    } else {
-      SelOp = AMDGPU::S_CSELECT_B64;
-      EltRC = &AMDGPU::SGPR_64RegClass;
-      SubIndices = Sub0_15_64;
-      NElts /= 2;
-    }
+    SelOp = AMDGPU::S_CSELECT_B64;
+    EltRC = &AMDGPU::SGPR_64RegClass;
+    SubIndices = Sub0_15_64;
+
+    assert(NElts % 2 == 0);
+    NElts /= 2;
   }
 
   MachineInstrBuilder MIB = BuildMI(
