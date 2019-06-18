@@ -951,7 +951,7 @@ void SIInstrInfo::storeRegToStackSlot(MachineBasicBlock &MBB,
     // needing them, and need to ensure that the reserved registers are
     // correctly handled.
 
-    FrameInfo.setStackID(FrameIndex, SIStackID::SGPR_SPILL);
+    FrameInfo.setStackID(FrameIndex, TargetStackID::SGPRSpill);
     if (ST.hasScalarStores()) {
       // m0 is used for offset to scalar stores if used to spill.
       Spill.addReg(AMDGPU::M0, RegState::ImplicitDefine | RegState::Dead);
@@ -1039,7 +1039,7 @@ void SIInstrInfo::loadRegFromStackSlot(MachineBasicBlock &MBB,
       MRI.constrainRegClass(DestReg, &AMDGPU::SReg_32_XM0RegClass);
     }
 
-    FrameInfo.setStackID(FrameIndex, SIStackID::SGPR_SPILL);
+    FrameInfo.setStackID(FrameIndex, TargetStackID::SGPRSpill);
     MachineInstrBuilder Spill = BuildMI(MBB, MI, DL, OpDesc, DestReg)
       .addFrameIndex(FrameIndex) // addr
       .addMemOperand(MMO)
@@ -1356,10 +1356,7 @@ bool SIInstrInfo::expandPostRAPseudo(MachineInstr &MI) const {
 
     MachineInstrBuilder MIB = BuildMI(MF, DL, get(AMDGPU::S_ADDC_U32), RegHi)
                                   .addReg(RegHi);
-    if (MI.getOperand(2).getTargetFlags() == SIInstrInfo::MO_NONE)
-      MIB.addImm(0);
-    else
-      MIB.add(MI.getOperand(2));
+    MIB.add(MI.getOperand(2));
 
     Bundler.append(MIB);
     finalizeBundle(MBB, Bundler.begin());
@@ -5832,7 +5829,9 @@ SIInstrInfo::getSerializableDirectMachineOperandTargetFlags() const {
     { MO_GOTPCREL32_LO, "amdgpu-gotprel32-lo" },
     { MO_GOTPCREL32_HI, "amdgpu-gotprel32-hi" },
     { MO_REL32_LO, "amdgpu-rel32-lo" },
-    { MO_REL32_HI, "amdgpu-rel32-hi" }
+    { MO_REL32_HI, "amdgpu-rel32-hi" },
+    { MO_ABS32_LO, "amdgpu-abs32-lo" },
+    { MO_ABS32_HI, "amdgpu-abs32-hi" },
   };
 
   return makeArrayRef(TargetFlags);
