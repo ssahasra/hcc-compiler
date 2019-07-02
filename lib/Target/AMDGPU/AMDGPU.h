@@ -196,6 +196,10 @@ ModulePass *createAMDGPUPrintfRuntimeBinding();
 void initializeAMDGPUPrintfRuntimeBindingPass(PassRegistry&);
 extern char &AMDGPUPrintfRuntimeBindingID;
 
+ModulePass *createAMDGPUPrintfLoweringPass();
+void initializeAMDGPUPrintfLoweringPass(PassRegistry&);
+extern char &AMDGPUPrintfLoweringID;
+
 ModulePass* createAMDGPUUnifyMetadataPass();
 void initializeAMDGPUUnifyMetadataPass(PassRegistry&);
 extern char &AMDGPUUnifyMetadataID;

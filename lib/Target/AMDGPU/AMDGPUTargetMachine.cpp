@@ -384,6 +384,11 @@ StringRef AMDGPUTargetMachine::getFeatureString(const Function &F) const {
     FSAttr.getValueAsString();
 }
 
+void AMDGPUTargetMachine::addPreLinkPasses(PassManagerBase & PM) {
+  PM.add(llvm::createAMDGPUOCL12AdapterPass());
+  PM.add(llvm::createAMDGPUPrintfLoweringPass());
+}
+
 /// Predicate for Internalize pass.
 static bool mustPreserveGV(const GlobalValue &GV) {
   if (const Function *F = dyn_cast<Function>(&GV))
