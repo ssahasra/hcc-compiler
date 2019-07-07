@@ -139,7 +139,6 @@ public:
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.addRequired<AMDGPUArgumentUsageInfo>();
-    AU.addRequired<AMDGPUPerfHintAnalysis>();
     AU.addRequired<LegacyDivergenceAnalysis>();
 #ifdef EXPENSIVE_CHECKS
     AU.addRequired<DominatorTreeWrapperPass>();
@@ -638,8 +637,12 @@ static unsigned selectSGPRVectorRegClassID(unsigned NumVectorElts) {
     return AMDGPU::SReg_32_XM0RegClassID;
   case 2:
     return AMDGPU::SReg_64RegClassID;
+  case 3:
+    return AMDGPU::SGPR_96RegClassID;
   case 4:
     return AMDGPU::SReg_128RegClassID;
+  case 5:
+    return AMDGPU::SGPR_160RegClassID;
   case 8:
     return AMDGPU::SReg_256RegClassID;
   case 16:
