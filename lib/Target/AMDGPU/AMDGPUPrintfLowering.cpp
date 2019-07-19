@@ -12,7 +12,13 @@
 
 #include "AMDGPU.h"
 #include "llvm/ADT/SparseBitVector.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/Transforms/Utils/BuildLibCalls.h"
+#include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/IR/DataLayout.h"
+
+#include <iostream>
 
 using namespace llvm;
 
@@ -22,26 +28,19 @@ namespace {
 class LLVM_LIBRARY_VISIBILITY AMDGPUPrintfLowering : public ModulePass {
 public:
   static char ID;
-  AMDGPUPrintfLowering();
-  bool runOnModule(Module &M) override;
-  bool doInitialization(Module &M) override;
-  bool doFinalization(Module &M) override;
-
+  AMDGPUPrintfLowering() : ModulePass(ID) {};
 private:
-  void getAnalysisUsage(AnalysisUsage &AU) const override {}
-
-  void initAnalysis(Module &M) {}
+  bool runOnModule(Module &M) override;
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.addRequired<TargetLibraryInfoWrapperPass>();
+  }
 };
 } // namespace
 
 char AMDGPUPrintfLowering::ID = 0;
 
-INITIALIZE_PASS_BEGIN(AMDGPUPrintfLowering, "amdgpu-printf-lowering",
-                      "AMDGPU Printf lowering", false, false)
-INITIALIZE_PASS_DEPENDENCY(TargetLibraryInfoWrapperPass)
-INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
-INITIALIZE_PASS_END(AMDGPUPrintfLowering, "amdgpu-printf-lowering",
-                    "AMDGPU Printf Lowering for Asynchronous Streams", false, false)
+INITIALIZE_PASS(AMDGPUPrintfLowering, "amdgpu-printf-lowering",
+                      "AMDGPU: Lower printf to hostcall", false, false)
 
 char &llvm::AMDGPUPrintfLoweringID = AMDGPUPrintfLowering::ID;
 
@@ -50,19 +49,6 @@ ModulePass *createAMDGPUPrintfLoweringPass() {
   return new AMDGPUPrintfLowering();
 }
 } // namespace llvm
-
-AMDGPUPrintfLowering::AMDGPUPrintfLowering() : ModulePass(ID) {
-  initializeAMDGPUPrintfLoweringPass(*PassRegistry::getPassRegistry());
-}
-
-typedef enum {
-  ARGTYPE_INVALID = 0,
-  ARGTYPE_INT32 = 1,
-  ARGTYPE_INT64 = 2,
-  ARGTYPE_FLOAT64 = 3,
-  ARGTYPE_CSTRING = 4,
-  ARGTYPE_POINTER = 5
-} PrintfTypeID;
 
 static bool isCString(const Value *Arg) {
   auto Ty = Arg->getType();
@@ -77,163 +63,159 @@ static bool isCString(const Value *Arg) {
   return IntTy->getBitWidth() == 8;
 }
 
-static uint64_t getArgTypeId(const Value *Arg) {
+static Value *fitArgInto64Bits(IRBuilder<> &Builder, Value *Arg) {
+  auto Int64Ty = Builder.getInt64Ty();
   auto Ty = Arg->getType();
   if (auto IntTy = dyn_cast<IntegerType>(Ty)) {
     switch (IntTy->getBitWidth()) {
     case 32:
-      return ARGTYPE_INT32;
+      return Builder.CreateZExt(Arg, Int64Ty);
     case 64:
-      return ARGTYPE_INT64;
+      return Arg;
     }
   } else if (Ty->getTypeID() == Type::DoubleTyID) {
-    return ARGTYPE_FLOAT64;
+    return Builder.CreateBitCast(Arg, Int64Ty);
   } else if (auto PtrTy = dyn_cast<PointerType>(Ty)) {
-    return ARGTYPE_POINTER;
+    return Builder.CreatePtrToInt(Arg, Int64Ty);
   }
 
   llvm_unreachable("unexpected type");
-  return ARGTYPE_INVALID;
-}
-
-static Value *fitArgInto64Bits(IRBuilder<> &Builder, Value *Arg,
-                               uint64_t typeID) {
-  auto Int64Ty = Builder.getInt64Ty();
-  switch (typeID) {
-  case ARGTYPE_INT64:
-    return Arg;
-  case ARGTYPE_INT32:
-    return Builder.CreateZExt(Arg, Int64Ty);
-  case ARGTYPE_FLOAT64:
-    return Builder.CreateBitCast(Arg, Int64Ty);
-  case ARGTYPE_CSTRING:
-  case ARGTYPE_POINTER:
-    return Builder.CreatePtrToInt(Arg, Int64Ty);
-  default:
-    llvm_unreachable("unexpected type ID");
-    return nullptr;
-  }
+  return Builder.getInt64(0);
 }
 
 static FunctionCallee getFnPrintfBegin(IRBuilder<> &Builder) {
   auto Int64Ty = Builder.getInt64Ty();
   auto M = Builder.GetInsertBlock()->getModule();
-  auto F = M->getOrInsertFunction("__ockl_printf_begin", Int64Ty, Int64Ty,
-                                  Int64Ty, Int64Ty);
+  auto F = M->getOrInsertFunction("__ockl_printf_begin", Int64Ty, Int64Ty);
   return F;
 }
 
-static FunctionCallee getFnAppendBytes(IRBuilder<> &Builder) {
-  auto Int64Ty = Builder.getInt64Ty();
-  auto CharPtrTy = Builder.getInt8PtrTy();
-  auto IntTy = Builder.getInt32Ty();
-  auto M = Builder.GetInsertBlock()->getModule();
-  auto F = M->getOrInsertFunction("__ockl_printf_append_bytes", Int64Ty,
-                                  Int64Ty, CharPtrTy, Int64Ty, IntTy);
-  return F;
+static Value *callPrintfBegin(IRBuilder<> &Builder, Value *Version) {
+  auto Fn = getFnPrintfBegin(Builder);
+  return Builder.CreateCall(Fn, Version);
 }
 
-static FunctionCallee getFnAppendArg(IRBuilder<> &Builder) {
+static FunctionCallee getFnAppendArgs(IRBuilder<> &Builder) {
   auto Int64Ty = Builder.getInt64Ty();
   auto Int32Ty = Builder.getInt32Ty();
   auto M = Builder.GetInsertBlock()->getModule();
-  auto F = M->getOrInsertFunction("__ockl_printf_append_arg", Int64Ty, Int64Ty,
-                                  Int64Ty, Int64Ty, Int32Ty);
+  auto F = M->getOrInsertFunction("__ockl_printf_append_args", Int64Ty, Int64Ty,
+                                  Int32Ty,
+                                  Int64Ty, Int64Ty, Int64Ty, Int64Ty,
+                                  Int64Ty, Int64Ty, Int64Ty, Int32Ty);
   return F;
 }
 
-static Value *callPrintfBegin(IRBuilder<> &Builder, Value *Version,
-                              Value *NumArgs, Value *FmtLength) {
-  auto Fn = getFnPrintfBegin(Builder);
-  return Builder.CreateCall(Fn, {Version, NumArgs, FmtLength});
+static Value *callAppendArgs(IRBuilder<> &Builder, Value *Desc, int NumArgs,
+                             Value *Arg0, Value *Arg1, Value *Arg2, Value *Arg3,
+                             Value *Arg4, Value *Arg5, Value *Arg6, bool IsLast) {
+  auto IsLastValue = Builder.getInt32(IsLast);
+  auto NumArgsValue = Builder.getInt32(NumArgs);
+  return Builder.CreateCall(getFnAppendArgs(Builder),
+                            {Desc, NumArgsValue, Arg0, Arg1, Arg2, Arg3, Arg4, Arg5, Arg6, IsLastValue});
 }
 
-static Value *callAppendBytes(IRBuilder<> &Builder, Value *Desc, Value *Str,
-                              Value *Len, bool isLast) {
+static FunctionCallee getFnAppendStringN(IRBuilder<> &Builder) {
+  auto Int64Ty = Builder.getInt64Ty();
+  auto CharPtrTy = Builder.getInt8PtrTy();
+  auto Int32Ty = Builder.getInt32Ty();
+  auto M = Builder.GetInsertBlock()->getModule();
+  auto F = M->getOrInsertFunction("__ockl_printf_append_string_n", Int64Ty, Int64Ty, CharPtrTy, Int64Ty, Int32Ty);
+  return F;
+}
+
+static Value *callAppendStringN(IRBuilder<> &Builder, Value *Desc, Value *Str,
+                                         Value *Length, bool isLast) {
   auto IsLastInt32 = Builder.getInt32(isLast);
-  auto Fn = getFnAppendBytes(Builder);
-  return Builder.CreateCall(Fn, {Desc, Str, Len, IsLastInt32});
+  auto Fn = getFnAppendStringN(Builder);
+  return Builder.CreateCall(Fn, {Desc, Str, Length, IsLastInt32});
 }
 
-static Value *callAppendArg(IRBuilder<> &Builder, Value *Desc, uint64_t typeID,
-                            Value *Arg, bool isLast) {
-  auto IsLastInt32 = Builder.getInt32(isLast);
-  auto TypeIdValue = Builder.getInt64(typeID);
-  Arg = fitArgInto64Bits(Builder, Arg, typeID);
-  return Builder.CreateCall(getFnAppendArg(Builder),
-                            {Desc, TypeIdValue, Arg, IsLastInt32});
+static Value *appendArg(IRBuilder<> &Builder, Value *Desc, Value *Arg, bool IsLast)
+{
+    auto Arg0 = fitArgInto64Bits(Builder, Arg);
+    auto Zero = Builder.getInt64(0);
+    return callAppendArgs(Builder, Desc, 1, Arg0,
+                          Zero, Zero, Zero, Zero, Zero, Zero, IsLast);
 }
 
-static Value *computeStringLength(IRBuilder<> &Builder, Value *CharString) {
-  auto *Prev = Builder.GetInsertBlock();
-  Module *M = Prev->getModule();
-
-  const DataLayout &DL = M->getDataLayout();
-  auto CharZero = Builder.getInt8(0);
-  auto One = Builder.getIntN(DL.getPointerSizeInBits(), 1);
-  auto Zero = Builder.getIntN(DL.getPointerSizeInBits(), 0);
-  auto SizeTy = One->getType();
-
-  auto Prefix = CharString->getName();
-  // Check for null pointer
-  BasicBlock *IfNull = Prev->splitBasicBlock(Builder.GetInsertPoint(),
-                                             Prefix + ".strlen.null");
-  auto CmpNull =
-      new ICmpInst(Prev->getTerminator(), CmpInst::ICMP_EQ, CharString,
-                   Constant::getNullValue(CharString->getType()));
-  Prev->getTerminator()->eraseFromParent();
-  BasicBlock *While =
-      BasicBlock::Create(M->getContext(), Prefix + ".strlen.while",
-                         Prev->getParent(), IfNull);
-  BranchInst::Create(IfNull, While, CmpNull, Prev);
-
-  // A while-loop that checks for end of string.
-  Builder.SetInsertPoint(While);
-  auto Str = Builder.CreateAddrSpaceCast(CharString, Builder.getInt8PtrTy());
-
-  auto PHI = Builder.CreatePHI(Str->getType(), 2);
-  PHI->addIncoming(Str, Prev);
-  auto GEPNext = Builder.CreateGEP(PHI, One);
-  PHI->addIncoming(GEPNext, While);
-
-  // Loop-exit
-  BasicBlock *WhileDone = BasicBlock::Create(
-      M->getContext(), Prefix + ".strlen.while.done",
-      Prev->getParent(), IfNull);
-  BranchInst::Create(IfNull, WhileDone);
-  auto Data = Builder.CreateLoad(PHI);
-  auto Cmp = Builder.CreateICmpEQ(Data, CharZero);
-  Builder.CreateCondBr(Cmp, WhileDone, While);
-
-  // Pointer arithmetic at loop exit:
-  // len = end - start + 1 ... this includes the nul character.
-  Builder.SetInsertPoint(WhileDone, WhileDone->begin());
-
-  auto Begin = Builder.CreatePtrToInt(CharString, SizeTy);
-  auto End = Builder.CreatePtrToInt(PHI, SizeTy);
-  auto Len = Builder.CreateSub(End, Begin);
-  Len = Builder.CreateAdd(Len, One);
-
-  Builder.SetInsertPoint(IfNull, IfNull->begin());
-  PHI = Builder.CreatePHI(Len->getType(), 2);
-  PHI->addIncoming(Len, WhileDone);
-  PHI->addIncoming(Zero, Prev);
-
-  return PHI;
+static Value *appendString(IRBuilder<> &Builder,
+                           const TargetLibraryInfo *TLI,
+                           Value *Desc, Value *Arg, bool IsLast)
+{
+  auto M = Builder.GetInsertBlock()->getModule();
+  auto DL = M->getDataLayout();
+  auto Length = llvm::emitStrLen(Arg, Builder, DL, TLI);
+  Length = Builder.CreateAdd(Length, Builder.getInt64(1));
+  return callAppendStringN(Builder, Desc, Arg, Length, IsLast);
 }
 
-static Value *processArg(IRBuilder<> &Builder, Value *Desc, Value *Arg,
-                         bool SpecIsCString, bool isLast) {
+static Value *processArg(IRBuilder<> &Builder,
+                         const TargetLibraryInfo *TLI,
+                         Value *Desc, Value *Arg,
+                         bool SpecIsCString, bool IsLast) {
   if (SpecIsCString && isCString(Arg)) {
-    auto Length = computeStringLength(Builder, Arg);
-    Desc = callAppendArg(Builder, Desc, ARGTYPE_CSTRING, Length, false);
-    return callAppendBytes(Builder, Desc, Arg, Length, isLast);
+    return appendString(Builder, TLI, Desc, Arg, IsLast);
   }
-  auto TypeId = getArgTypeId(Arg);
-  return callAppendArg(Builder, Desc, TypeId, Arg, isLast);
+  return appendArg(Builder, Desc, Arg, IsLast);
 }
 
-static void collectPrintfsFromModule(SmallVectorImpl<Value *> &Printfs,
+static void locateCStrings(SparseBitVector<64> &BV, Value *Fmt) {
+  StringRef Str;
+  if (!getConstantStringInfo(Fmt, Str) || Str.empty())
+    return;
+
+  static const char ConvSpecifiers[] = "diouxXfFeEgGaAcspn";
+  size_t SpecPos = 0;
+  // Skip the first argument, the format string.
+  unsigned ArgIdx = 1;
+
+  while ((SpecPos = Str.find_first_of('%', SpecPos)) != StringRef::npos) {
+    if (Str[SpecPos + 1] == '%') {
+      SpecPos += 2;
+      continue;
+    }
+    auto SpecEnd = Str.find_first_of(ConvSpecifiers, SpecPos);
+    if (SpecEnd == StringRef::npos)
+      return;
+    auto Spec = Str.slice(SpecPos, SpecEnd + 1);
+    ArgIdx += Spec.count('*');
+    if (Str[SpecEnd] == 's') {
+      BV.set(ArgIdx);
+    }
+    SpecPos = SpecEnd + 1;
+    ++ArgIdx;
+  }
+}
+
+static void lowerPrintf(IRBuilder<> &Builder, const TargetLibraryInfo *TLI,
+                        CallInst *CI) {
+  auto NumOps = CI->getNumArgOperands();
+  assert(NumOps >= 1);
+
+  Builder.SetInsertPoint(CI);
+  Builder.SetCurrentDebugLocation(CI->getDebugLoc());
+
+  auto Fmt = CI->getArgOperand(0);
+  SparseBitVector<64> SpecIsCString;
+  locateCStrings(SpecIsCString, Fmt);
+
+  auto Desc =
+      callPrintfBegin(Builder, Builder.getIntN(64, 0));
+  Desc = appendString(Builder, TLI, Desc, Fmt, NumOps == 1);
+
+  // Write out the actual arguments following the format string.
+  for (unsigned int i = 1; i != NumOps; ++i) {
+    bool IsLast = i == NumOps - 1;
+    bool IsCString = SpecIsCString.test(i);
+    Desc = processArg(Builder, TLI, Desc, CI->getArgOperand(i), IsCString, IsLast);
+  }
+
+  Desc = Builder.CreateTrunc(Desc, Builder.getInt32Ty());
+  CI->replaceAllUsesWith(Desc);
+}
+
+static void collectPrintfsFromModule(SmallVectorImpl<CallInst *> &Printfs,
                                      Module &M) {
   for (auto &MF : M) {
     if (MF.isDeclaration())
@@ -250,103 +232,21 @@ static void collectPrintfsFromModule(SmallVectorImpl<Value *> &Printfs,
   }
 }
 
-static void removePrintf(Module &M) {
-  if (Function *F = M.getFunction("printf"))
-    F->eraseFromParent();
-}
-
-static void locateCStrings(SparseBitVector<64> &BV, Value *Ptr) {
-    Ptr->stripPointerCasts()->dump();
-    auto Const = dyn_cast<Constant>(Ptr->stripPointerCasts());
-  if (!Const)
-    return;
-  GlobalVariable *GVar = dyn_cast<GlobalVariable>(Const);
-  if (!GVar || !GVar->hasInitializer())
-      return;
-  auto Init = GVar->getInitializer();
-  auto CA = dyn_cast<ConstantDataArray>(Init);
-  if (!CA || !CA->isString())
-    return;
-  auto Fmt = CA->getAsCString();
-
-  static const char ConvSpecifiers[] = "diouxXfFeEgGaAcspnCS";
-  size_t SpecPos = 0;
-  // Skip the first argument, the format string.
-  unsigned ArgIdx = 1;
-
-  while ((SpecPos = Fmt.find_first_of('%', SpecPos)) != StringRef::npos) {
-    if (Fmt[SpecPos + 1] == '%') {
-      ++SpecPos;
-      continue;
-    }
-    auto SpecEnd = Fmt.find_first_of(ConvSpecifiers, SpecPos);
-    if (SpecEnd == StringRef::npos)
-      return;
-    auto Spec = Fmt.slice(SpecPos, SpecEnd + 1);
-    ArgIdx += Spec.count('*');
-    if (Fmt[SpecEnd] == 's') {
-      BV.set(ArgIdx);
-    }
-    SpecPos = SpecEnd + 1;
-    ++ArgIdx;
-  }
-}
-
-static void lowerPrintf(IRBuilder<> &Builder, Value *P) {
-  CallInst *CI = cast<CallInst>(P);
-  auto NumOps = CI->getNumArgOperands();
-  assert(NumOps >= 1);
-
-  Builder.SetInsertPoint(CI);
-  Builder.SetCurrentDebugLocation(CI->getDebugLoc());
-
-  auto NumArgs = Builder.getIntN(64, NumOps - 1);
-  auto Fmt = CI->getArgOperand(0);
-  auto FmtLength = computeStringLength(Builder, Fmt);
-  SparseBitVector<64> SpecIsCString;
-  locateCStrings(SpecIsCString, Fmt);
-
-  auto Desc =
-      callPrintfBegin(Builder, Builder.getIntN(64, 0), NumArgs, FmtLength);
-  Desc = callAppendBytes(Builder, Desc, Fmt, FmtLength, NumOps == 1);
-
-  // Write out the actual arguments following the format string.
-  for (unsigned int i = 1; i != NumOps; ++i) {
-    bool isLast = i == NumOps - 1;
-    bool isCString = SpecIsCString.test(i);
-    Desc = processArg(Builder, Desc, CI->getArgOperand(i), isCString, isLast);
-  }
-
-  Desc =
-      Builder.CreateIntCast(Desc, Builder.getInt32Ty(), /* isSigned = */ true);
-  P->replaceAllUsesWith(Desc);
-}
-
 bool AMDGPUPrintfLowering::runOnModule(Module &M) {
   LLVMContext &Ctx = M.getContext();
   IRBuilder<> Builder(Ctx);
+  auto TLI = &getAnalysis<TargetLibraryInfoWrapperPass>().getTLI();
 
-  SmallVector<Value *, 32> Printfs;
+  SmallVector<CallInst *, 32> Printfs;
   collectPrintfsFromModule(Printfs, M);
   if (Printfs.empty()) {
     return false;
   }
 
   for (auto P : Printfs) {
-    lowerPrintf(Builder, P);
+    lowerPrintf(Builder, TLI, P);
+    P->eraseFromParent();
   }
-
-  // erase the printf calls
-  for (auto P : Printfs) {
-    CallInst *CI = dyn_cast<CallInst>(P);
-    CI->eraseFromParent();
-  }
-
-  removePrintf(M);
 
   return true;
 }
-
-bool AMDGPUPrintfLowering::doInitialization(Module &M) { return false; }
-
-bool AMDGPUPrintfLowering::doFinalization(Module &M) { return false; }
