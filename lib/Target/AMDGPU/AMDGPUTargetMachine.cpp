@@ -760,6 +760,8 @@ void AMDGPUPassConfig::addCodeGenPrepare() {
 
 bool AMDGPUPassConfig::addPreISel() {
   addPass(createLowerSwitchPass());
+  addPass(createEliminateIrreducibilityPass());
+  addPass(createUnifyLoopExitsPass());
   addPass(createFlattenCFGPass());
   return false;
 }
