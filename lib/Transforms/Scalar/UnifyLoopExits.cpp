@@ -39,39 +39,6 @@ Pass *llvm::createUnifyLoopExitsPass() {
   return new UnifyLoopExitsPass();
 }
 
-/*
-template <class LoopInfoT>
-static void makeReducible(LoopWalker<LoopInfoT> &G,
-                          std::vector<typename LoopWalker<LoopInfoT>::BlockT *> &Nodes) {
-  using BlockT = typename LoopWalker<LoopInfoT>::BlockT;
-  SmallPtrSet<BlockT*, 8> Blocks;
-  SmallVector<BlockT*, 8> Headers;
-  for (auto N : Nodes) {
-    Blocks.insert(N);
-  }
-
-  for (auto I : Nodes) {
-    for (const auto P : predecessors(I)) {
-      if (!Blocks.count(P) && G.isIncomingPred(P)) {
-        Headers.push_back(I);
-        break;
-      }
-    }
-  }
-
-  dbgs() << "Irreducible loop: (";
-  for (auto H : Headers) {
-    dbgs() << " " << H->getName();
-  }
-  dbgs() << ")";
-  for (auto I : Nodes) {
-    dbgs() << " " << I->getName();
-  }
-  dbgs() << "\n";
-}
-
-*/
-
 static Value *invert(Value *Condition) {
   // First: Check if it's a constant
   if (Constant *C = dyn_cast<Constant>(Condition))
@@ -220,12 +187,12 @@ static void squeeze(const BBSetVector &Predecessors, const BBSetVector &Successo
     auto Successor = Successors[i];
     auto Phi = PHINode::Create(BoolTrue->getType(), Predecessors.size(), "", PreHeader);
     Guards[Successor] = Phi;
-    dbgs() << "Guard for " << Successor->getName() << ": ";
     auto Preds = Predicates[Successor];
-    for (auto P : Preds) {
-      dbgs() << " " << P.first->getName();
-    }
-    dbgs() << "\n";
+    LLVM_DEBUG(dbgs() << "Guard for " << Successor->getName() << ": ";
+               for (auto P : Preds) {
+                 dbgs() << " " << P.first->getName();
+               }
+               dbgs() << "\n");
     Predicates.erase(Successor);
     for (auto P : Preds) {
       Phi->addIncoming(P.second, P.first);
@@ -303,23 +270,23 @@ static void unifyLoopExits(const LoopInfo &LI, Loop *L) {
     }
   }
 
-  dbgs() << "Found successor:";
-  for (auto H : Successors) {
-    dbgs() << " " << H->getName();
-  }
-  dbgs() << "\n";
+  LLVM_DEBUG(dbgs() << "Found successor:";
+             for (auto H : Successors) {
+               dbgs() << " " << H->getName();
+             }
+             dbgs() << "\n");
 
-  dbgs() << "Found predecessors:";
-  for (auto P : Predecessors) {
-    dbgs() << " " << P->getName();
-  }
-  dbgs() << "\n";
+  LLVM_DEBUG(dbgs() << "Found predecessors:";
+             for (auto P : Predecessors) {
+               dbgs() << " " << P->getName();
+             }
+             dbgs() << "\n");
 
   squeeze(Predecessors, Successors);
 }
 
 bool UnifyLoopExitsPass::runOnFunction(Function &F) {
-  dbgs() << "===== Function: " << F.getName() << "\n";
+  LLVM_DEBUG(dbgs() << "===== Function: " << F.getName() << "\n");
   auto &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
 
   auto Loops = LI.getLoopsInPreorder();

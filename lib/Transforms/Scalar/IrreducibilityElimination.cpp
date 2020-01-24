@@ -40,39 +40,6 @@ Pass *llvm::createEliminateIrreducibilityPass() {
   return new EliminateIrreducibilityPass();
 }
 
-/*
-template <class LoopInfoT>
-static void makeReducible(LoopWalker<LoopInfoT> &G,
-                          std::vector<typename LoopWalker<LoopInfoT>::BlockT *> &Nodes) {
-  using BlockT = typename LoopWalker<LoopInfoT>::BlockT;
-  SmallPtrSet<BlockT*, 8> Blocks;
-  SmallVector<BlockT*, 8> Headers;
-  for (auto N : Nodes) {
-    Blocks.insert(N);
-  }
-
-  for (auto I : Nodes) {
-    for (const auto P : predecessors(I)) {
-      if (!Blocks.count(P) && G.isIncomingPred(P)) {
-        Headers.push_back(I);
-        break;
-      }
-    }
-  }
-
-  dbgs() << "Irreducible loop: (";
-  for (auto H : Headers) {
-    dbgs() << " " << H->getName();
-  }
-  dbgs() << ")";
-  for (auto I : Nodes) {
-    dbgs() << " " << I->getName();
-  }
-  dbgs() << "\n";
-}
-
-*/
-
 static Value *invert(Value *Condition) {
   // First: Check if it's a constant
   if (Constant *C = dyn_cast<Constant>(Condition))
@@ -130,17 +97,17 @@ static void squeeze(Function &F, const BBSetVector &Headers) {
     }
   }
 
-  dbgs() << "Found headers:";
-  for (auto H : Headers) {
-    dbgs() << " " << H->getName();
-  }
-  dbgs() << "\n";
+  LLVM_DEBUG(dbgs() << "Found headers:";
+             for (auto H : Headers) {
+               dbgs() << " " << H->getName();
+             }
+             dbgs() << "\n");
 
-  dbgs() << "Found predecessors:";
-  for (auto P : Predecessors) {
-    dbgs() << " " << P->getName();
-  }
-  dbgs() << "\n";
+  LLVM_DEBUG(dbgs() << "Found predecessors:";
+             for (auto P : Predecessors) {
+               dbgs() << " " << P->getName();
+             }
+             dbgs() << "\n");
 
     for (auto Predecessor : Predecessors) {
     auto Branch = cast<BranchInst>(Predecessor->getTerminator());
@@ -204,12 +171,12 @@ static void squeeze(Function &F, const BBSetVector &Headers) {
     auto Header = Headers[i];
     auto Phi = PHINode::Create(BoolTrue->getType(), Predecessors.size(), "", PreHeader);
     Guards[Header] = Phi;
-    dbgs() << "Guard for " << Header->getName() << ": ";
     auto Preds = Predicates[Header];
-    for (auto P : Preds) {
-      dbgs() << " " << P.first->getName();
-    }
-    dbgs() << "\n";
+    LLVM_DEBUG(dbgs() << "Guard for " << Header->getName() << ": ";
+               for (auto P : Preds) {
+                 dbgs() << " " << P.first->getName();
+               }
+               dbgs() << "\n");
     Predicates.erase(Header);
     for (auto P : Preds) {
       Phi->addIncoming(P.second, P.first);
@@ -271,7 +238,7 @@ static void makeReducible(Function &F, LoopWalker<LoopInfo> &G) {
 }
 
 bool EliminateIrreducibilityPass::runOnFunction(Function &F) {
-  dbgs() << "===== Function: " << F.getName() << "\n";
+  LLVM_DEBUG(dbgs() << "===== Function: " << F.getName() << "\n");
   auto &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
 
   auto Loops = LI.getLoopsInPreorder();
